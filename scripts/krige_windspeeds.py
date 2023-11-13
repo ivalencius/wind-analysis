@@ -3,7 +3,7 @@ from tqdm import tqdm, trange
 # import sys
 from glob import glob
 # Better debugging printing
-from icecream import ic
+# from icecream import ic
 # Working with data
 import xarray as xr
 import numpy as np
@@ -11,9 +11,9 @@ import pandas as pd
 import regionmask
 import scipy.stats as stats
 # Parallel processing
-from joblib import Parallel, delayed, parallel_config
+# from joblib import Parallel, delayed, parallel_config
 import gstools as gs
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 
 def load_states(path):
     # Get all station files
@@ -76,43 +76,93 @@ def krige_states(state_path, temis_precision="0500deg"):
     elev_shape = temis_state['elevation'].shape
     
     # Start the kriging process
-    fit_model = gs.Stable(latlon=True, var=0.921, len_scale=1.14, nugget=0.639, geo_scale=57.3, alpha=0.666)
+    # fit_model = gs.Stable(latlon=True, var=0.921, len_scale=1.14, nugget=0.639, geo_scale=57.3, alpha=0.666)
     # Loop over each time period
     start_year = 1950
     fields = []
     stds = []
     for y in trange(2022-start_year+1, desc='Kriging data [years]'):
+        # This is the long step
+        year_data = (
+            l48
+            .sel(time=slice(f'{start_year+y}-01-01', f'{start_year+y}-12-31'))
+            .load()
+        )
         for m in trange(12, desc='Months', leave=False):
             month = m+1
             # Select data
             month = f'{start_year+y}-{month:02d}'
-            # end = f'{start_year}-{month:02d}-31'
             l48_stat = (
-                l48.sel(time=month)
-                .load()
-                .where(lambda x: x['windspeeds'].notnull(), drop=True)
+                year_data.sel(time=month)
+                .where(lambda x: x['windspeeds'] >= 0, drop=True)
+                .where(lambda x: x['windspeeds'] < 100, drop=True)
             )
             l48_mon = l48_stat.mean('time')
             # Generate errors
             n = l48_stat['station_id'].size
             errs = []
             for s in range(n):
-                # Station data
+                # Station data (no need to take mean by state, filter will remove nans)
                 station = l48_stat.isel(station_id=s)
                 # Filter out bad windspeeds
                 wind = station['windspeeds'].values
                 # Cant use 0 for gamma distribution estimations
-                good_wind = wind[wind > 0]
+                good_wind = wind[(wind > 0) & (wind < 100)]
                 if len(good_wind) <= 1:
                     # If no non-zero winds or just one good observation, cannot determine error
                     errs.append(np.nan)
                 else:
-                    ag,bg,cg = stats.gamma.fit(good_wind, floc=0)
-                    errs.append(stats.gamma.std(ag,bg,cg))
+                    try:
+                        # If all measurements are the same this will fail
+                        ag,bg,cg = stats.gamma.fit(good_wind, floc=0)
+                        errs.append(stats.gamma.std(ag,bg,cg))
+                    except:
+                        errs.append(np.nan)
                     
             # For sites with one observation, set error to be mean of all other errors
             errs = np.array(errs)
             errs[np.isnan(errs)] = np.nanmean(errs)
+            # Data 
+            cond_pos = [
+                l48_mon['longitude'].values.flatten(),
+                l48_mon['latitude'].values.flatten()
+            ]
+            cond_val = l48_mon['windspeeds'].mean('state').values.flatten()
+            # Determine variogram model
+            models = {
+                "Gaussian": gs.Gaussian,
+                "Exponential": gs.Exponential,
+                "Matern": gs.Matern,
+                "Stable": gs.Stable,
+                "Rational": gs.Rational,
+                "Circular": gs.Circular,
+                "Spherical": gs.Spherical,
+                "SuperSpherical": gs.SuperSpherical,
+                "JBessel": gs.JBessel,
+            }
+            scores = {}
+            ms = {}
+            bin_size = float(temis_precision[:4])/1000
+            bins = np.arange(0, 5, bin_size) # max window of 5 degrees
+            # bins = gs.variogram.standard_bins(variogram_pos, bin_no=499, max_dist = 5, latlon=True, geo_scale=gs.tools.DEGREE_SCALE)
+            bin_center, gamma = gs.vario_estimate(
+                cond_pos, cond_val, bins,
+                latlon=True, geo_scale=gs.tools.DEGREE_SCALE
+            )
+            # fit all models to the estimated variogram
+            for model in tqdm(models):
+                fit_model = models[model](latlon=True, geo_scale=gs.tools.DEGREE_SCALE)
+                try:
+                    para, pcov, r2 = fit_model.fit_variogram(bin_center, gamma, return_r2=True)
+                    fit_model.plot(x_max=5, ax=ax[1])
+                    scores[model] = r2
+                    ms[model] = fit_model
+                except:
+                    scores[model] = np.nan
+                    ms[model] = ''
+            # Best model at index zero
+            ranking = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+            fit_model = ms[ranking[0][0]]
             # l48_mon['gamma_err'] = xr.DataArray(errs, dims='station_id', coords={'station_id': l48_mon['station_id']})
             # l48_mon['gamma_err'].attrs['units'] = 'm/s'
             # Get temis data at station locations
@@ -131,11 +181,8 @@ def krige_states(state_path, temis_precision="0500deg"):
             ]
             krig = gs.krige.ExtDrift(
                 model=fit_model,
-                cond_pos=[
-                    l48_mon['longitude'].values.flatten(),
-                    l48_mon['latitude'].values.flatten()
-                ],
-                cond_val=l48_mon['windspeeds'].mean('state').values.flatten(),
+                cond_pos=cond_pos,
+                cond_val=cond_val,
                 ext_drift = train_drift,
                 exact=False,
                 cond_err=errs
@@ -175,14 +222,59 @@ def krige_states(state_path, temis_precision="0500deg"):
     ds.to_netcdf(f'../data/kriged_windspeeds_{temis_precision}.nc', engine='netcdf4')
 
 
-def viz_kriged(file):
-    ds = xr.load_dataset(file)
-    fig, ax = plt.subplots(figsize=(10, 10))
-    ax.errorbar(ds.time, ds.windspeeds.mean({'lat', 'lon'}), yerr=ds.windspeeds_std.mean({'lat', 'lon'}))
-    ax.set_xlabel('Time')
-    ax.set_ylabel('Windspeed [m/s]')
-    ax.set_title('Mean Lower 48 Windspeeds')
-    plt.show()
+def combine_fields(path, temis_precision="0500deg"):
+    print('Loading TEMIS elevations data...')
+    t_file = glob(f'../data/TEMIS/*{temis_precision}*.nc')[0]
+    temis = (
+        xr.load_dataset(t_file)
+        .isel(nbounds=1)
+    )
+    # Mask by states
+    print('Masking TEMIS data...')
+    state_mask = regionmask.defined_regions.natural_earth_v5_0_0.us_states_50
+    # Hawaii and Alaska are not included in the mask
+    good_keys = [
+        k for k in state_mask.regions.keys() 
+        if k not in state_mask.map_keys(['Hawaii', 'Alaska'])
+    ]
+    temis_state = temis.where(
+        state_mask.mask(temis['longitude'], temis['latitude']).isin(good_keys), 
+        drop=True
+    )
+    
+    # Generate grid for prediction
+    print('Generating grid...')
+    lons, lats = np.meshgrid(
+        temis_state['longitude'].values.flatten(),
+        temis_state['latitude'].values.flatten()
+    )
+    
+    # Load fields
+    k_files = sorted(glob(f'{path}/*k_field.npy'))
+    std_files = sorted(glob(f'{path}/*std_field.npy'))
+    fields = np.load(k_files, allow_pickle=True)
+    stds = np.load(std_files, allow_pickle=True)
+    
+    # Generate dataset to hold values
+    ds = xr.Dataset(
+        data_vars=dict(
+            windspeeds=(['time', 'x', 'y'], fields),
+            windspeeds_std=(['time', 'x', 'y'], stds),
+        ),
+        coords=dict(
+            lon=(["x", "y"], lons),
+            lat=(["x", "y"], lats),
+            time=(["time"], pd.date_range("1950-01-01", "2022-12-31", freq="M")),
+        ),
+        attrs=dict(description=f'Kriged windspeeds at {temis} resolution'),
+    )
+    # Add data variables to dataset
+    ds['windspeeds'].attrs['units'] = 'm/s'
+    ds['windspeeds'].attrs['description'] = 'Kriged windspeeds'
+    ds['windspeeds_std'].attrs['units'] = 'm/s'
+    ds['windspeeds_std'].attrs['description'] = 'Kriging standard deviation'
+    print('Saving dataset...')
+    ds.to_netcdf(f'../data/kriged_windspeeds_{temis_precision}.nc', engine='netcdf4')
     
     
     
