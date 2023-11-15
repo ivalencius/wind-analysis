@@ -13,7 +13,7 @@ import scipy.stats as stats
 # Parallel processing
 # from joblib import Parallel, delayed, parallel_config
 import gstools as gs
-# import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 
 def load_states(path):
     # Get all station files
@@ -75,8 +75,8 @@ def krige_states(state_path, temis_precision="0500deg"):
     )
     elev_shape = temis_state['elevation'].shape
     
-    # Start the kriging process
-    # fit_model = gs.Stable(latlon=True, var=0.921, len_scale=1.14, nugget=0.639, geo_scale=57.3, alpha=0.666)
+   # Use spherical model (from Joyner et al. 2015)
+    base_model = gs.Spherical(latlon=True, geo_scale=gs.tools.KM_SCALE)
     # Loop over each time period
     start_year = 1950
     fields = []
@@ -129,58 +129,58 @@ def krige_states(state_path, temis_precision="0500deg"):
             ]
             cond_val = l48_mon['windspeeds'].mean('state').values.flatten()
             # Determine variogram model
-            models = {
-                "Gaussian": gs.Gaussian,
-                "Exponential": gs.Exponential,
-                "Matern": gs.Matern,
-                "Stable": gs.Stable,
-                "Rational": gs.Rational,
-                "Circular": gs.Circular,
-                "Spherical": gs.Spherical,
-                "SuperSpherical": gs.SuperSpherical,
-                "JBessel": gs.JBessel,
-            }
-            scores = {}
-            ms = {}
-            bin_size = float(temis_precision[:4])/1000
-            bins = np.arange(0, 5, bin_size) # max window of 5 degrees
+            # models = {
+            #     "Gaussian": gs.Gaussian,
+            #     "Exponential": gs.Exponential,
+            #     "Matern": gs.Matern,
+            #     "Stable": gs.Stable,
+            #     "Rational": gs.Rational,
+            #     # "Circular": gs.Circular, # no good in 3D
+            #     "Spherical": gs.Spherical,
+            #     "SuperSpherical": gs.SuperSpherical,
+            #     "JBessel": gs.JBessel,
+            # }
+            # Max bin size is 5 degrees but 
+            # bin_size = float(temis_precision[:4])/1000
+            # bins = np.arange(0, 5, bin_size) # max window of 5 degrees
             # bins = gs.variogram.standard_bins(variogram_pos, bin_no=499, max_dist = 5, latlon=True, geo_scale=gs.tools.DEGREE_SCALE)
             bin_center, gamma = gs.vario_estimate(
-                cond_pos, cond_val, bins,
-                latlon=True, geo_scale=gs.tools.DEGREE_SCALE
+                cond_pos, cond_val,
+                latlon=True, geo_scale=gs.tools.KM_SCALE
             )
-            # fit all models to the estimated variogram
-            for model in tqdm(models):
-                fit_model = models[model](latlon=True, geo_scale=gs.tools.DEGREE_SCALE)
-                try:
-                    para, pcov, r2 = fit_model.fit_variogram(bin_center, gamma, return_r2=True)
-                    fit_model.plot(x_max=5, ax=ax[1])
-                    scores[model] = r2
-                    ms[model] = fit_model
-                except:
-                    scores[model] = np.nan
-                    ms[model] = ''
-            # Best model at index zero
-            ranking = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-            fit_model = ms[ranking[0][0]]
-            # l48_mon['gamma_err'] = xr.DataArray(errs, dims='station_id', coords={'station_id': l48_mon['station_id']})
-            # l48_mon['gamma_err'].attrs['units'] = 'm/s'
-            # Get temis data at station locations
+            # # fit all models to the estimated variogram
+            # best_r2 = 0
+            # best_model = None
+            # for model in models:
+            #     fit_model = models[model](
+            #         latlon=True, geo_scale=gs.tools.KM_SCALE
+            #     )
+            #     try:
+            #         # nugget = False because we have measurement
+            #         para, pcov, r2 = fit_model.fit_variogram(
+            #             bin_center, gamma, return_r2=True, nugget=False
+            #         )
+            #         if r2 > best_r2:
+            #             best_model = fit_model
+            #             best_r2 = r2                    
+            #     except:
+            #         continue
+            # nugget = False because we have measurement
+            _ = base_model.fit_variogram(
+                bin_center, gamma, nugget=False
+            )
+
             temis_station = temis.sel(
                 latitude=l48_mon['latitude'], 
                 longitude=l48_mon['longitude'], 
                 method='nearest'
             )
-            # Get holdout stations
-            # holdout =  np.random.choice(n, int(np.floor(len(n*0.1))), replace=False)
-            # Take indexes *not* in holdout stations
-            # train = np.setdiff1d(np.arange(n), holdout)
             train_drift = [
                 temis_station['elevation'].values.flatten(),
                 temis_station['elevation_stddev'].values.flatten()
             ]
             krig = gs.krige.ExtDrift(
-                model=fit_model,
+                model=base_model,
                 cond_pos=cond_pos,
                 cond_val=cond_val,
                 ext_drift = train_drift,
@@ -202,8 +202,7 @@ def krige_states(state_path, temis_precision="0500deg"):
             # Store data
             fields.append(k_field)
             stds.append(std_field)
-        # Increment year
-        # start_year += 1
+            
     # Convert to numpy arrays and save
     print('Saving data...')
     fields = np.array(fields)
