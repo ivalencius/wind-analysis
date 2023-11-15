@@ -23,9 +23,7 @@ def load_states(path):
     ]
     l48 = (
         xr.open_mfdataset(state_files, combine='nested', concat_dim='state')
-        .sel(time=slice("1950-01-01", None))
-        .where(lambda x: (x['windspeeds'] >= 0).compute(), drop=True)
-        .resample(time='1D').mean()
+        .sel(time=slice("2021-01-01", None))
         .chunk("auto")
     )
     return l48
@@ -69,32 +67,35 @@ def krige_states(state_path, temis_precision="0500deg"):
         coords=dict(
             lon=(["x", "y"], lons),
             lat=(["x", "y"], lats),
-            time=(["time"], pd.date_range("1950-01-01", "2022-12-31", freq="M")),
+            time=(["time"], pd.date_range("2021-01-01", "2022-12-31", freq="M")),
         ),
         attrs=dict(description=f'Kriged windspeeds at {temis} resolution'),
     )
     elev_shape = temis_state['elevation'].shape
     
    # Use spherical model (from Joyner et al. 2015)
-    base_model = gs.Spherical(latlon=True, geo_scale=gs.tools.KM_SCALE)
+    # base_model = gs.Spherical(latlon=True, geo_scale=gs.tools.KM_SCALE)
     # Loop over each time period
-    start_year = 1950
+    start_year = 2021
     fields = []
     stds = []
     for y in trange(2022-start_year+1, desc='Kriging data [years]'):
+        current_year = start_year+y
         # This is the long step
         year_data = (
             l48
-            .sel(time=slice(f'{start_year+y}-01-01', f'{start_year+y}-12-31'))
+            .sel(time=slice(f'{current_year}-01-01', f'{current_year}-12-31'))
+            .resample(time='1D').mean()
             .load()
         )
         for m in trange(12, desc='Months', leave=False):
             month = m+1
+            time_label = str(current_year)+'-'+str(month)
             # Select data
-            month = f'{start_year+y}-{month:02d}'
+            month = f'{current_year}-{month:02d}'
             l48_stat = (
                 year_data.sel(time=month)
-                .where(lambda x: x['windspeeds'] >= 0, drop=True)
+                .where(lambda x: x['windspeeds'] > 0, drop=True)
                 .where(lambda x: x['windspeeds'] < 100, drop=True)
             )
             l48_mon = l48_stat.mean('time')
@@ -105,70 +106,76 @@ def krige_states(state_path, temis_precision="0500deg"):
                 # Station data (no need to take mean by state, filter will remove nans)
                 station = l48_stat.isel(station_id=s)
                 # Filter out bad windspeeds
-                wind = station['windspeeds'].values
+                wind = station['windspeeds'].mean('state').values
                 # Cant use 0 for gamma distribution estimations
                 good_wind = wind[(wind > 0) & (wind < 100)]
-                if len(good_wind) <= 1:
+                # Want 20+ observations per month
+                if len(good_wind) < 20:
                     # If no non-zero winds or just one good observation, cannot determine error
-                    errs.append(np.nan)
+                    errs.append(-999)
                 else:
-                    try:
-                        # If all measurements are the same this will fail
-                        ag,bg,cg = stats.gamma.fit(good_wind, floc=0)
-                        errs.append(stats.gamma.std(ag,bg,cg))
-                    except:
-                        errs.append(np.nan)
-                    
-            # For sites with one observation, set error to be mean of all other errors
+                    # If all measurements are the same this will fail
+                    ag,bg,cg = stats.gamma.fit(good_wind, floc=0)
+                    errs.append(stats.gamma.std(ag,bg,cg))
             errs = np.array(errs)
-            errs[np.isnan(errs)] = np.nanmean(errs)
+            # For stations with bad data, get their index
+            good_stations = np.where(errs != -999)
             # Data 
             cond_pos = [
-                l48_mon['longitude'].values.flatten(),
-                l48_mon['latitude'].values.flatten()
+                l48_mon['longitude'].values.flatten()[good_stations],
+                l48_mon['latitude'].values.flatten()[good_stations]
             ]
-            cond_val = l48_mon['windspeeds'].mean('state').values.flatten()
+            cond_val = l48_mon['windspeeds'].mean('state').values.flatten()[good_stations]
             # Determine variogram model
-            # models = {
-            #     "Gaussian": gs.Gaussian,
-            #     "Exponential": gs.Exponential,
-            #     "Matern": gs.Matern,
-            #     "Stable": gs.Stable,
-            #     "Rational": gs.Rational,
-            #     # "Circular": gs.Circular, # no good in 3D
-            #     "Spherical": gs.Spherical,
-            #     "SuperSpherical": gs.SuperSpherical,
-            #     "JBessel": gs.JBessel,
-            # }
-            # Max bin size is 5 degrees but 
+            models = {
+                "Gaussian": gs.Gaussian,
+                "Exponential": gs.Exponential,
+                "Matern": gs.Matern,
+                "Stable": gs.Stable,
+                "Rational": gs.Rational,
+                # "Circular": gs.Circular, # no good in 3D
+                "Spherical": gs.Spherical,
+                "SuperSpherical": gs.SuperSpherical,
+                "JBessel": gs.JBessel,
+            }
+            # Max bin size is 5 degrees, group by TEMIS elevation
             # bin_size = float(temis_precision[:4])/1000
             # bins = np.arange(0, 5, bin_size) # max window of 5 degrees
+            # Get bin number from Sturges Rule, max distance of 500 km
+            bins = gs.variogram.standard_bins(cond_pos, max_dist = 500, latlon=True, geo_scale=gs.tools.KM_SCALE)
             # bins = gs.variogram.standard_bins(variogram_pos, bin_no=499, max_dist = 5, latlon=True, geo_scale=gs.tools.DEGREE_SCALE)
             bin_center, gamma = gs.vario_estimate(
-                cond_pos, cond_val,
+                cond_pos, cond_val, bins,
                 latlon=True, geo_scale=gs.tools.KM_SCALE
             )
-            # # fit all models to the estimated variogram
-            # best_r2 = 0
-            # best_model = None
-            # for model in models:
-            #     fit_model = models[model](
-            #         latlon=True, geo_scale=gs.tools.KM_SCALE
-            #     )
-            #     try:
-            #         # nugget = False because we have measurement
-            #         para, pcov, r2 = fit_model.fit_variogram(
-            #             bin_center, gamma, return_r2=True, nugget=False
-            #         )
-            #         if r2 > best_r2:
-            #             best_model = fit_model
-            #             best_r2 = r2                    
-            #     except:
-            #         continue
-            # nugget = False because we have measurement
-            _ = base_model.fit_variogram(
-                bin_center, gamma, nugget=False
-            )
+            # fit all models to the estimated variogram
+            best_r2 = 0
+            best_model = None
+            for model in models:
+                fit_model = models[model](
+                    latlon=True, geo_scale=gs.tools.KM_SCALE
+                )
+                try:
+                    # nugget = False because we have measurement
+                    para, pcov, r2 = fit_model.fit_variogram(
+                        bin_center, gamma, return_r2=True
+                    )
+                    if r2 > best_r2:
+                        best_model = fit_model
+                        best_r2 = r2                    
+                except:
+                    continue
+
+            # para, pcov, r2 = base_model.fit_variogram(
+            #     bin_center, gamma, return_r2=True
+            # )
+            
+            ax = best_model.plot(x_max=500)
+            ax.scatter(bin_center, gamma)
+            ax.set_xlabel('Distance [km]')
+            ax.set_ylabel('Semivariance')
+            ax.set_title(f'{time_label} variogram (R$^2$={r2:.2f})')
+            plt.savefig(f'../plots/kriged-variograms/'+time_label+'-variogram.png')  
 
             temis_station = temis.sel(
                 latitude=l48_mon['latitude'], 
@@ -176,16 +183,16 @@ def krige_states(state_path, temis_precision="0500deg"):
                 method='nearest'
             )
             train_drift = [
-                temis_station['elevation'].values.flatten(),
-                temis_station['elevation_stddev'].values.flatten()
+                temis_station['elevation'].values.flatten()[good_stations],
+                temis_station['elevation_stddev'].values.flatten()[good_stations]
             ]
             krig = gs.krige.ExtDrift(
-                model=base_model,
+                model=best_model,
                 cond_pos=cond_pos,
                 cond_val=cond_val,
                 ext_drift = train_drift,
                 exact=False,
-                cond_err=errs
+                cond_err=errs[good_stations]
             )
             all_drift = [
                 temis_state['elevation'].values.flatten(),
@@ -196,9 +203,8 @@ def krige_states(state_path, temis_precision="0500deg"):
             k_field = field.reshape(elev_shape)
             std_field = np.sqrt(variance).reshape(elev_shape)
             # Write to file
-            label_year = start_year+y
-            k_field.dump(f'../data/kriged_HadISD/{label_year}-{month}-k_field.npy')
-            std_field.dump(f'../data/kriged_HadISD/{label_year}-{month}-std_field.npy')
+            k_field.dump(f'../data/kriged_HadISD/'+time_label+'-k_field.npy')
+            std_field.dump(f'../data/kriged_HadISD/'+time_label+'-std_field.npy')
             # Store data
             fields.append(k_field)
             stds.append(std_field)
@@ -263,7 +269,7 @@ def combine_fields(path, temis_precision="0500deg"):
         coords=dict(
             lon=(["x", "y"], lons),
             lat=(["x", "y"], lats),
-            time=(["time"], pd.date_range("1950-01-01", "2022-12-31", freq="M")),
+            time=(["time"], pd.date_range("2021-01-01", "2022-12-31", freq="M")),
         ),
         attrs=dict(description=f'Kriged windspeeds at {temis} resolution'),
     )
